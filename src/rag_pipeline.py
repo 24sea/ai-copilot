@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import BinaryIO, TypedDict
 
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
 
 from src.config import (
     LLM_MODEL,
@@ -55,9 +55,6 @@ def answer_question(question: str, top_k: int = RETRIEVAL_TOP_K) -> AnswerResult
     """Answer a user question using retrieved document context."""
     if not question.strip():
         raise ValueError("Question cannot be empty.")
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is not configured.")
-
     retrieved = retrieve_relevant_chunks(question, top_k=top_k)
     if not retrieved:
         return {
@@ -72,19 +69,34 @@ def answer_question(question: str, top_k: int = RETRIEVAL_TOP_K) -> AnswerResult
     context = _format_context(sources)
     prompt = QA_PROMPT_TEMPLATE.format(context=context, question=question)
 
+    if not OPENAI_API_KEY:
+        logger.warning("OPENAI_API_KEY is not configured. Using demo answer mode.")
+        return {
+            "answer": _build_demo_answer(question, sources),
+            "sources": sources,
+        }
+
     client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
-    response = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": "You answer questions grounded in user-provided PDFs.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-    )
-    answer = response.choices[0].message.content or ""
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You answer questions grounded in user-provided PDFs.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        answer = response.choices[0].message.content or ""
+    except OpenAIError as exc:
+        logger.warning("LLM request failed. Using demo answer mode. Reason: %s", exc)
+        return {
+            "answer": _build_demo_answer(question, sources),
+            "sources": sources,
+        }
+
     logger.info("Generated answer for question with %s sources", len(sources))
     return {"answer": answer.strip(), "sources": sources}
 
@@ -101,3 +113,19 @@ def _format_context(sources: list[SourceChunk]) -> str:
         )
         context_blocks.append(f"{citation}\n{source['text']}")
     return "\n\n".join(context_blocks)
+
+
+def _build_demo_answer(question: str, sources: list[SourceChunk]) -> str:
+    """Build a simple local answer when an LLM is unavailable."""
+    best_source = sources[0]
+    metadata = best_source["metadata"]
+    source_name = metadata.get("source", "the uploaded document")
+    page = metadata.get("page", "unknown")
+
+    return (
+        "Demo mode answer: I could not call the configured LLM, so I am showing "
+        "the most relevant retrieved document context instead.\n\n"
+        f"Question: {question}\n\n"
+        f"Most relevant source: {source_name}, page {page}\n\n"
+        f"{best_source['text']}"
+    )
